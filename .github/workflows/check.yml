@@ -1,0 +1,43 @@
+name: Перевірка графіка
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"    # кожні 5 хв, мінімум для GitHub (може запізнюватись)
+  workflow_dispatch:          # кнопка «Run workflow» для ручного запуску
+
+permissions:
+  contents: write             # щоб зберігати список уже опублікованих графіків
+
+concurrency:
+  group: schedule-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Встановлення
+        run: pip install -r requirements.txt
+
+      - name: Перевірка і публікація
+        env:
+          BOT_TOKEN:  ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+        run: python bot.py
+
+      - name: Збереження стану
+        run: |
+          if [ -n "$(git status --porcelain state/)" ]; then
+            git config user.name  "schedule-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add state/
+            git commit -m "Опубліковано новий графік"
+            git push
+          fi
