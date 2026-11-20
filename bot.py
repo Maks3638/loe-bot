@@ -110,6 +110,129 @@ def from_site():
     return versions
 
 
+# ---------- джерело: Telegram-канал LOE ----------
+#
+# Пости з графіком у каналі @lvivoblenergo — це картинки без тексту.
+# Дату і час «станом на» розпізнаємо з картинки (Tesseract) і приймаємо
+# пост лише тоді, коли ВСІ перевірки зійшлися:
+#   1) заголовок картинки — «Графік погодинних відключень»;
+#   2) дата в помаранчевій плашці — реальна дата;
+#   3) рядок «станом на ЧЧ:ХХ ДД.ММ.РРРР» розпізнано повністю;
+#   4) графік на той самий або наступний день після «станом на»;
+#   5) час посту в Telegram відрізняється від «станом на» не більше ніж на 90 хв.
+# Будь-який сумнів — пост пропускаємо (графік однаково прийде з сайту).
+
+TG_CHANNEL = "lvivoblenergo"
+TG_MAX_AGE_HOURS = 24
+
+
+def _tess(img, args):
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        img.save(f.name)
+    try:
+        return subprocess.run(["tesseract", f.name, "-", *args],
+                              capture_output=True, text=True, timeout=60).stdout.strip()
+    finally:
+        os.unlink(f.name)
+
+
+def _orange_box(im):
+    """Координати помаранчевої плашки з датою у верхній частині картинки."""
+    w, h = im.size
+    px = im.load()
+    pts = [(x, y) for y in range(int(h * 0.15)) for x in range(w)
+           if px[x, y][0] > 200 and 120 < px[x, y][1] < 200 and px[x, y][2] < 90]
+    if len(pts) < 200:
+        return None
+    ys = sorted({y for _, y in pts})
+    y0 = y1 = ys[0]
+    for y in ys[1:]:
+        if y - y1 > 2:
+            break
+        y1 = y
+    xs = [x for x, y in pts if y0 <= y <= y1]
+    return (min(xs), y0, max(xs) + 1, y1 + 1)
+
+
+def read_schedule_image(data: bytes):
+    """Повертає (дата_графіка, datetime_станом_на) або None, якщо є сумнів."""
+    from io import BytesIO
+    from PIL import Image, ImageOps
+
+    im = Image.open(BytesIO(data)).convert("RGB")
+    w, h = im.size
+    if not (1.5 < h / w < 3):  # графік у каналі — висока вертикальна картинка
+        return None
+
+    def big(c, k=4):
+        return ImageOps.autocontrast(c.convert("L").resize((c.width * k, c.height * k), Image.LANCZOS))
+
+    head = _tess(big(im.crop((0, 0, w, int(h * 0.045))), 3), ["-l", "ukr", "--psm", "7"]).lower()
+    if "погодин" not in head and "відключ" not in head:
+        return None
+
+    box = _orange_box(im)
+    if not box:
+        return None
+    date = _tess(big(im.crop(box)), ["--psm", "7", "-c", "tessedit_char_whitelist=0123456789."])
+    if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", date) or not valid_date(date):
+        return None
+
+    bottom = _tess(big(im.crop((0, int(h * 0.95), int(w * 0.75), int(h * 0.985)))),
+                   ["--psm", "7", "-c", "tessedit_char_whitelist=0123456789.:"])
+    m = re.fullmatch(r"(\d{2}):(\d{2})\s*(\d{2})\.(\d{2})\.(\d{4})", bottom)
+    if not m:
+        return None
+    upd = parse_upd("станом на {}:{} {}.{}.{}".format(*m.groups()))
+    if not upd:
+        return None
+
+    sched = datetime.strptime(date, "%d.%m.%Y").date()
+    if sched not in (upd.date(), upd.date() + timedelta(days=1)):
+        return None
+    return date, upd
+
+
+def from_telegram():
+    r = requests.get(f"https://t.me/s/{TG_CHANNEL}", headers={"User-Agent": HEADERS["User-Agent"]}, timeout=30)
+    r.raise_for_status()
+    page = r.text
+    now = datetime.now(KYIV)
+
+    versions = []
+    chunks = re.split(r'(?=<div class="tgme_widget_message_wrap)', page)
+    for chunk in chunks[-15:]:  # останні пости каналу
+        post = re.search(r'data-post="([^"]+)"', chunk)
+        when = re.search(r'<time[^>]*datetime="([^"]+)"', chunk)
+        photos = re.findall(r"tgme_widget_message_photo_wrap[^>]*background-image:url\('([^']+)'\)", chunk)
+        if not (post and when and photos):
+            continue
+        posted = datetime.fromisoformat(when.group(1)).astimezone(KYIV)
+        if now - posted > timedelta(hours=TG_MAX_AGE_HOURS):
+            continue
+        for url in photos:
+            try:
+                img = requests.get(url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=30)
+                img.raise_for_status()
+                res = read_schedule_image(img.content)
+            except Exception as e:
+                print(f"Telegram {post.group(1)}: не вдалося обробити фото ({e})")
+                continue
+            if not res:
+                continue  # не графік або розпізнано з сумнівом
+            date, upd = res
+            gap = abs(posted.replace(tzinfo=None) - upd)
+            if gap > timedelta(minutes=90):
+                print(f"Telegram {post.group(1)}: «станом на» {upd:%H:%M} не збігається з часом посту "
+                      f"{posted:%H:%M}, пропускаю")
+                continue
+            v = Version(date, upd, url, "telegram")
+            v.image_bytes = img.content
+            versions.append(v)
+    return versions
+
+
 # ---------- стан ----------
 
 def load_state():
@@ -142,6 +265,8 @@ def push_state():
     for attempt in range(4):
         if subprocess.run(["git", "push", "-q"]).returncode == 0:
             return
+        # У репозиторії з'явились нові коміти (наприклад, оновлення коду) — підтягуємо.
+        subprocess.run(["git", "pull", "-q", "--rebase"])
         time.sleep(5 * (attempt + 1))
     raise RuntimeError("Не вдалося зберегти стан у репозиторій")
 
@@ -160,7 +285,8 @@ def send_photo(image: bytes, caption: str):
     r = requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
         data={"chat_id": CHANNEL_ID, "caption": caption},
-        files={"photo": ("grafik.png", image, "image/png")},
+        files={"photo": ("grafik.jpg", image, "image/jpeg") if image[:2] == b"\xff\xd8"
+               else ("grafik.png", image, "image/png")},
         timeout=60,
     )
     if not r.ok:
@@ -169,7 +295,7 @@ def send_photo(image: bytes, caption: str):
 
 def check_once():
     versions = []
-    for name, fn in (("сайт", from_site),):
+    for name, fn in (("сайт", from_site), ("telegram", from_telegram)):
         try:
             versions += fn()
         except Exception as e:  # одне джерело лягло — працюємо з іншими
@@ -183,7 +309,9 @@ def check_once():
     for v in versions:
         if datetime.strptime(v.date, "%d.%m.%Y").date() < today:
             continue  # графік на минулий день не публікуємо
-        if v.date not in best or v.upd > best[v.date].upd:
+        cur = best.get(v.date)
+        # Новіша версія виграє; при однаковому часі — сайт (там чіткіша картинка).
+        if cur is None or v.upd > cur.upd or (v.upd == cur.upd and v.source == "сайт"):
             best[v.date] = v
 
     for date in sorted(best, key=lambda d: datetime.strptime(d, "%d.%m.%Y")):
@@ -197,9 +325,12 @@ def check_once():
         print(f"{v} — НОВА версія, публікую:\n{caption}\n{v.image_url}\n")
         if DRY_RUN:
             continue
-        img = requests.get(v.image_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=60)
-        img.raise_for_status()
-        send_photo(img.content, caption)
+        data = getattr(v, "image_bytes", None)
+        if data is None:
+            img = requests.get(v.image_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=60)
+            img.raise_for_status()
+            data = img.content
+        send_photo(data, caption)
         st["dates"][date] = {"upd": v.key, "source": v.source}
         save_state(st)  # зберігаємо одразу після кожного поста
 
