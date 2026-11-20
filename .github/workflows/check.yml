@@ -1,12 +1,15 @@
 name: Перевірка графіка
 
+# Кожен запуск ~55 хв перевіряє графік кожні 2 хв, а наприкінці сам запускає
+# наступний. Cron — запасний варіант, якщо ланцюжок колись обірветься.
 on:
   schedule:
-    - cron: "*/5 * * * *"    # кожні 5 хв, мінімум для GitHub (може запізнюватись)
-  workflow_dispatch:          # кнопка «Run workflow» для ручного запуску
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
 
 permissions:
-  contents: write             # щоб зберігати список уже опублікованих графіків
+  contents: write   # зберігати пам'ять бота (state/state.json)
+  actions: write    # запускати наступний цикл
 
 concurrency:
   group: schedule-check
@@ -15,7 +18,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 65
     steps:
       - uses: actions/checkout@v4
 
@@ -26,18 +29,23 @@ jobs:
       - name: Встановлення
         run: pip install -r requirements.txt
 
-      - name: Перевірка і публікація
+      - name: Перевірка і публікація (цикл ~55 хв)
         env:
           BOT_TOKEN:  ${{ secrets.BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          LOOP_MINUTES: "2"
+          LOOP_TOTAL_MINUTES: "55"
+          PUSH_STATE: "1"
         run: python bot.py
 
-      - name: Збереження стану
+      - name: Запуск наступного циклу
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -n "$(git status --porcelain state/)" ]; then
-            git config user.name  "schedule-bot"
-            git config user.email "bot@users.noreply.github.com"
-            git add state/
-            git commit -m "Опубліковано новий графік"
-            git push
+          # Якщо в черзі вже чекає запуск (від cron), новий не створюємо.
+          q=$(gh run list -R "$GITHUB_REPOSITORY" -w check.yml -s queued --json databaseId -q 'length')
+          p=$(gh run list -R "$GITHUB_REPOSITORY" -w check.yml -s pending --json databaseId -q 'length')
+          if [ "$q" = "0" ] && [ "$p" = "0" ]; then
+            gh workflow run check.yml -R "$GITHUB_REPOSITORY" --ref main
           fi
