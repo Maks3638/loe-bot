@@ -1,6 +1,6 @@
 name: Перевірка графіка
 
-# Кожен запуск ~55 хв перевіряє графік кожні 2 хв, а наприкінці сам запускає
+# Кожен запуск ~55 хв перевіряє графік щохвилини, а наприкінці сам запускає
 # наступний. Cron — запасний варіант, якщо ланцюжок колись обірветься.
 on:
   schedule:
@@ -35,7 +35,7 @@ jobs:
         env:
           BOT_TOKEN:  ${{ secrets.BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-          LOOP_MINUTES: "2"
+          LOOP_MINUTES: "1"
           LOOP_TOTAL_MINUTES: "55"
           PUSH_STATE: "1"
         run: python bot.py

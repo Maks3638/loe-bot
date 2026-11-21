@@ -124,6 +124,7 @@ def from_site():
 
 TG_CHANNEL = "lvivoblenergo"
 TG_MAX_AGE_HOURS = 24
+_photo_cache = {}  # url картинки → (результат розпізнавання, байти)
 
 
 def _tess(img, args):
@@ -212,13 +213,18 @@ def from_telegram():
         if now - posted > timedelta(hours=TG_MAX_AGE_HOURS):
             continue
         for url in photos:
-            try:
-                img = requests.get(url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=30)
-                img.raise_for_status()
-                res = read_schedule_image(img.content)
-            except Exception as e:
-                print(f"Telegram {post.group(1)}: не вдалося обробити фото ({e})")
-                continue
+            if url in _photo_cache:  # цю картинку вже розпізнавали
+                res, content = _photo_cache[url]
+            else:
+                try:
+                    img = requests.get(url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=30)
+                    img.raise_for_status()
+                    content = img.content
+                    res = read_schedule_image(content)
+                except Exception as e:
+                    print(f"Telegram {post.group(1)}: не вдалося обробити фото ({e})")
+                    continue
+                _photo_cache[url] = (res, content if res else None)
             if not res:
                 continue  # не графік або розпізнано з сумнівом
             date, upd = res
@@ -228,7 +234,7 @@ def from_telegram():
                       f"{posted:%H:%M}, пропускаю")
                 continue
             v = Version(date, upd, url, "telegram")
-            v.image_bytes = img.content
+            v.image_bytes = content
             versions.append(v)
     return versions
 
