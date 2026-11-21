@@ -268,7 +268,59 @@ def push_state():
         # У репозиторії з'явились нові коміти (наприклад, оновлення коду) — підтягуємо.
         subprocess.run(["git", "pull", "-q", "--rebase"])
         time.sleep(5 * (attempt + 1))
-    raise RuntimeError("Не вдалося зберегти стан у репозиторій")
+    raise StateNotSaved("Не вдалося зберегти стан у репозиторій")
+
+
+class StateNotSaved(Exception):
+    """Пам'ять не збереглась: далі не публікуємо, щоб не наробити дублів."""
+
+
+# ---------- запобіжник: перевірка нашого власного каналу ----------
+#
+# Незалежно від файлу пам'яті бот перед публікацією перечитує свій канал
+# (публічний перегляд t.me/s/...) і шукає там пости з підписом
+# «(ДД.ММ.РРРР) ... Останнє оновлення - ЧЧ:ХХ ДД.ММ.РРРР». Якщо така або новіша
+# версія для цієї дати вже є в каналі — не публікуємо.
+
+_channel_username = None
+
+
+def channel_username():
+    global _channel_username
+    if _channel_username is None:
+        _channel_username = ""
+        if CHANNEL_ID.startswith("@"):
+            _channel_username = CHANNEL_ID[1:]
+        elif BOT_TOKEN:
+            try:
+                r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
+                                 params={"chat_id": CHANNEL_ID}, timeout=30)
+                _channel_username = (r.json().get("result") or {}).get("username") or ""
+            except Exception as e:
+                print(f"Не вдалося дізнатися юзернейм каналу: {e}")
+                _channel_username = None  # спробуємо наступного разу
+                return ""
+        if _channel_username == "":
+            print("Канал без публічного юзернейму — перевірку каналу вимкнено")
+    return _channel_username or ""
+
+
+def posted_in_channel():
+    """{дата: найновіший "РРРР-ММ-ДД ЧЧ:ХХ"} з останніх постів нашого каналу, або None."""
+    name = channel_username()
+    if not name:
+        return None
+    r = requests.get(f"https://t.me/s/{name}", headers={"User-Agent": HEADERS["User-Agent"]}, timeout=30)
+    r.raise_for_status()
+    text = unescape(re.sub(r"<[^>]+>", " ", re.sub(r"<br\s*/?>", "\n", r.text)))
+    text = re.sub(r"\s+", " ", text)
+    found = {}
+    for m in re.finditer(r"\((\d{2}\.\d{2}\.\d{4})\) Останнє оновлення - (\d{1,2}:\d{2}) (\d{2}\.\d{2}\.\d{4})", text):
+        upd = parse_upd(f"станом на {m.group(2)} {m.group(3)}")
+        if upd:
+            key = upd.strftime("%Y-%m-%d %H:%M")
+            found[m.group(1)] = max(found.get(m.group(1), ""), key)
+    return found
 
 
 # ---------- публікація ----------
@@ -291,6 +343,7 @@ def send_photo(image: bytes, caption: str):
     )
     if not r.ok:
         raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
+    print(f"Опубліковано, message_id={r.json()['result']['message_id']}")
 
 
 def check_once():
@@ -314,11 +367,27 @@ def check_once():
         if cur is None or v.upd > cur.upd or (v.upd == cur.upd and v.source == "сайт"):
             best[v.date] = v
 
+    channel = None
     for date in sorted(best, key=lambda d: datetime.strptime(d, "%d.%m.%Y")):
         v = best[date]
         last = st["dates"].get(date, {}).get("upd", "")
         if last and v.key <= last:
             print(f"{v} — вже опубліковано (останнє: {last}), пропускаю")
+            continue
+
+        # Другий запобіжник: дивимось, що реально є в нашому каналі.
+        if channel is None:
+            try:
+                channel = posted_in_channel() or {}
+            except Exception as e:
+                print(f"Не вдалося перечитати канал ({e}), покладаюсь на пам'ять бота")
+                channel = {}
+        in_channel = channel.get(date, "")
+        if in_channel and v.key <= in_channel:
+            print(f"{v} — уже є в каналі (останнє там: {in_channel}), пропускаю і запам'ятовую")
+            if not DRY_RUN:
+                st["dates"][date] = {"upd": in_channel, "source": "канал"}
+                save_state(st)
             continue
 
         caption = make_caption(v)
@@ -345,6 +414,8 @@ def main():
     while True:
         try:
             check_once()
+        except StateNotSaved as e:
+            sys.exit(f"СТОП: {e}")
         except Exception as e:
             print(f"Помилка: {e}")
         if LOOP_TOTAL_MINUTES and time.time() - started + LOOP_MINUTES * 60 > LOOP_TOTAL_MINUTES * 60:
