@@ -320,6 +320,7 @@ def posted_in_channel():
         if upd:
             key = upd.strftime("%Y-%m-%d %H:%M")
             found[m.group(1)] = max(found.get(m.group(1), ""), key)
+    print(f"Перевірка каналу t.me/s/{name}: знайдено {found or 'нічого'}")
     return found
 
 
