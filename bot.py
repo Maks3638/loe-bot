@@ -408,6 +408,10 @@ def check_once():
 def main():
     if not DRY_RUN and not (BOT_TOKEN and CHANNEL_ID):
         sys.exit("Задай BOT_TOKEN і CHANNEL_ID")
+    try:  # самоперевірка запобіжника на старті
+        posted_in_channel()
+    except Exception as e:
+        print(f"Самоперевірка: не вдалося перечитати канал ({e})")
     if not LOOP_MINUTES:
         check_once()
         return
